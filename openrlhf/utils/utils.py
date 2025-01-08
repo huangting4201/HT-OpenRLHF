@@ -1,7 +1,13 @@
 import os
 
+import torch
+
 from datasets import interleave_datasets, load_dataset, load_from_disk
 from transformers import AutoTokenizer
+
+from .logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -24,6 +30,23 @@ def get_tokenizer(pretrain, model, padding_side="left", strategy=None, use_fast=
 
 
 def get_strategy(args):
+    if args.fsdp:
+        from openrlhf.utils.fsdp import FSDPStrategy
+
+        strategy = FSDPStrategy(
+            seed=getattr(args, "seed", 42),
+            max_norm=getattr(args, "max_norm", 1.0),
+            micro_train_batch_size=getattr(args, "micro_train_batch_size", 1),
+            train_batch_size=getattr(args, "train_batch_size", 128),
+            mode="v1",
+            bf16=getattr(args, "bf16", True),
+            args=args,
+        )
+
+        logger.info(f"using FSDP Strategy...")
+
+        return strategy
+
     from openrlhf.utils.deepspeed import DeepspeedStrategy
 
     strategy = DeepspeedStrategy(
@@ -35,6 +58,9 @@ def get_strategy(args):
         bf16=getattr(args, "bf16", True),
         args=args,
     )
+
+    logger.info(f"using DeepSpeed Strategy...")
+
     return strategy
 
 
@@ -65,9 +91,7 @@ def blending_datasets(
 
         ext = os.path.splitext(dataset)[-1]
         # local python script
-        if ext == ".py" or (
-            os.path.isdir(dataset) and os.path.exists(os.path.join(dataset, f"{dataset_basename}.py"))
-        ):
+        if ext == ".py" or (os.path.isdir(dataset) and os.path.exists(os.path.join(dataset, f"{dataset_basename}.py"))):
             data = load_dataset(dataset, trust_remote_code=True)
             strategy.print(f"loaded {dataset} with python script")
         # local text file
@@ -129,3 +153,55 @@ def convert_token_to_id(token, tokenizer):
         return token[0]
     else:
         raise ValueError("token should be int or str")
+
+
+class DummyProfile:
+    """
+    Dummy Profile.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, a, b, c):
+        pass
+
+    def step(self):
+        pass
+
+
+def initialize_profile(profiling: bool = False, start_time: str = None):
+    """Initialize and return the profiler context manager instance."""
+
+    local_rank = torch.distributed.get_rank()
+
+    if profiling and local_rank == 0:
+        schedule_config = {"wait": 1, "warmup": 1, "active": 1, "repeat": 1, "skip_first": 3}
+        trace_path = os.path.join(
+            os.environ.get("log_folder", "RUN"),
+            os.environ.get("JOB_NAME", "demo"),
+            start_time,
+            "traces",
+            f"rank{local_rank}",
+        )
+
+        _profile = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(**schedule_config),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_path),
+            with_stack=True,
+            with_modules=True,
+            profile_memory=True,
+        )
+        logger.info(f"Do profiling for GPU on rank {local_rank}!")
+    else:
+        _profile = DummyProfile()
+
+    return _profile
+
+
+def get_current_device():
+    return torch.device("cuda:{}".format(torch.cuda.current_device()))

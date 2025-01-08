@@ -1,5 +1,6 @@
 import os
 from abc import ABC
+from datetime import datetime
 
 import torch
 from flash_attn.utils.distributed import all_gather
@@ -9,6 +10,7 @@ from tqdm import tqdm
 
 from openrlhf.models import DPOLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
+from openrlhf.utils.utils import initialize_profile
 
 
 class DPOTrainer(ABC):
@@ -133,77 +135,88 @@ class DPOTrainer(ABC):
             acc_mean = 0
             loss_mean = 0
             # train
-            for data in self.train_dataloader:
-                if not self.packing_samples:
-                    chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
-                    chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
-                    c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
-                    reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
-                    r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
+            with initialize_profile(
+                profiling=args.profiling, start_time=datetime.now().strftime("%m-%d-%H:%M:%S")
+            ) as prof:
+                for data in self.train_dataloader:
+                    if not self.packing_samples:
+                        chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
+                        chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
+                        c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
+                        reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
+                        r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
 
-                    chosen_logps, rejected_logps, aux_loss, nll_loss = self.concatenated_forward(
-                        self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
-                    )
-                    with torch.no_grad():
-                        reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
-                            self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                        chosen_logps, rejected_logps, aux_loss, nll_loss = self.concatenated_forward(
+                            self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
                         )
-                else:
-                    packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens = data
-                    packed_input_ids, packed_attention_masks = packed_input_ids.to(
-                        torch.cuda.current_device()
-                    ), packed_attention_masks.to(torch.cuda.current_device())
-                    chosen_logps, rejected_logps, aux_loss, nll_loss = self.packed_samples_forward(
-                        self.model, packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens
-                    )
-                    with torch.no_grad():
-                        reference_chosen_logps, reference_rejected_logps, _, _ = self.packed_samples_forward(
-                            self.ref_model, packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens
+                        with torch.no_grad():
+                            reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
+                                self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                            )
+                    else:
+                        packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens = data
+                        packed_input_ids, packed_attention_masks = packed_input_ids.to(
+                            torch.cuda.current_device()
+                        ), packed_attention_masks.to(torch.cuda.current_device())
+                        chosen_logps, rejected_logps, aux_loss, nll_loss = self.packed_samples_forward(
+                            self.model, packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens
                         )
+                        with torch.no_grad():
+                            reference_chosen_logps, reference_rejected_logps, _, _ = self.packed_samples_forward(
+                                self.ref_model,
+                                packed_input_ids,
+                                packed_attention_masks,
+                                packed_seq_lens,
+                                prompt_id_lens,
+                            )
 
-                # loss function
-                preference_loss, chosen_reward, reject_reward = self.loss_fn(
-                    chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
-                )
-                # mixtral
-                if not self.aux_loss:
-                    aux_loss = 0
-                # nll loss
-                if not self.nll_loss:
-                    nll_loss = 0
+                    # loss function
+                    preference_loss, chosen_reward, reject_reward = self.loss_fn(
+                        chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
+                    )
+                    # mixtral
+                    if not self.aux_loss:
+                        aux_loss = 0
+                    # nll loss
+                    if not self.nll_loss:
+                        nll_loss = 0
 
-                loss = preference_loss + aux_loss * self.args.aux_loss_coef + nll_loss * self.args.nll_loss_coef
-                self.strategy.backward(loss, self.model, self.optimizer)
-                self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
+                    loss = preference_loss + aux_loss * self.args.aux_loss_coef + nll_loss * self.args.nll_loss_coef
+                    self.strategy.backward(loss, self.model, self.optimizer)
 
-                acc = (chosen_reward > reject_reward).float().mean().item()
-                acc_mean = acc_mean * 0.9 + 0.1 * acc
-                loss_mean = loss_mean * 0.9 + 0.1 * preference_loss.item()
-                # dpo logs
-                logs_dict = {
-                    "loss": preference_loss.item(),
-                    "acc": acc,
-                    "chosen_reward": chosen_reward.mean().item(),
-                    "reject_reward": reject_reward.mean().item(),
-                    "loss_mean": loss_mean,
-                    "acc_mean": acc_mean,
-                    "lr": self.scheduler.get_last_lr()[0],
-                }
-                if self.nll_loss:
-                    logs_dict["nll_loss"] = nll_loss.item()
-                # step bar
-                logs_dict = self.strategy.all_reduce(logs_dict)
-                step_bar.set_postfix(logs_dict)
-                step_bar.update()
+                    if step % self.strategy.accumulated_gradient == 0:
+                        self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
-                # logs/checkpoints/evaluation
-                if step % self.strategy.accumulated_gradient == 0:
-                    global_step = step // self.strategy.accumulated_gradient
-                    client_states = {"consumed_samples": global_step * args.train_batch_size}
-                    self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
+                    acc = (chosen_reward > reject_reward).float().mean().item()
+                    acc_mean = acc_mean * 0.9 + 0.1 * acc
+                    loss_mean = loss_mean * 0.9 + 0.1 * preference_loss.item()
+                    # dpo logs
+                    logs_dict = {
+                        "loss": preference_loss.item(),
+                        "acc": acc,
+                        "chosen_reward": chosen_reward.mean().item(),
+                        "reject_reward": reject_reward.mean().item(),
+                        "loss_mean": loss_mean,
+                        "acc_mean": acc_mean,
+                        "lr": self.scheduler.get_last_lr()[0],
+                    }
+                    if self.nll_loss:
+                        logs_dict["nll_loss"] = nll_loss.item()
+                    # step bar
+                    logs_dict = self.strategy.all_reduce(logs_dict)
+                    step_bar.set_postfix(logs_dict)
+                    step_bar.update()
 
-                step += 1
-            epoch_bar.update()
+                    # logs/checkpoints/evaluation
+                    if step % self.strategy.accumulated_gradient == 0:
+                        global_step = step // self.strategy.accumulated_gradient
+                        client_states = {"consumed_samples": global_step * args.train_batch_size}
+                        self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
+                        prof.step()
+
+                    step += 1
+
+                epoch_bar.update()
 
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
@@ -434,9 +447,9 @@ class DPOTrainer(ABC):
             if rank == self.strategy.ring_attn_size - 1:
                 # add a dummy label to the last logit
                 local_label = F.pad(local_label, (0, 1), value=0)
-            local_per_token_logps = torch.gather(
-                logits.log_softmax(-1), dim=2, index=local_label.unsqueeze(2)
-            ).squeeze(2)
+            local_per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=local_label.unsqueeze(2)).squeeze(
+                2
+            )
             # we may not need to all_gather the entire tensor, but it's easier to implement.
             # use the flash_attn all_gather so that the all_gather has correct backward.
             per_token_logps = all_gather(local_per_token_logps, self.strategy.ring_attn_group).reshape((1, -1))

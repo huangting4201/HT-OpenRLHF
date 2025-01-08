@@ -40,7 +40,7 @@ def get_train_ds_config(
         zero_opt_dict["contiguous_gradients"] = True
 
     return {
-        "steps_per_print": 100,
+        "steps_per_print": 1,
         "zero_optimization": zero_opt_dict,
         "bf16": {
             "enabled": bf16,

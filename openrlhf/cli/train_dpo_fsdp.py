@@ -20,6 +20,7 @@ def train(args):
     # load huggingface model
     model = Actor(
         args.pretrain,
+        # "checkpoint/llama3-8b-dpo",
         use_flash_attention_2=args.flash_attn,
         bf16=args.bf16,
         load_in_4bit=args.load_in_4bit,
@@ -27,9 +28,11 @@ def train(args):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=args.target_modules,
-        ds_config=strategy.get_ds_train_config(is_actor=True),
+        ds_config=strategy.get_ds_train_config(is_actor=True) if not args.fsdp else None,
         packing_samples=args.packing_samples,
     )
+
+    print("after model init", flush=True)
 
     # configure tokenizer
     tokenizer = get_tokenizer(args.pretrain, model.model, "right", strategy, use_fast=not args.disable_fast_tokenizer)
@@ -41,7 +44,7 @@ def train(args):
         use_flash_attention_2=args.flash_attn,
         bf16=args.bf16,
         load_in_4bit=args.load_in_4bit,
-        ds_config=strategy.get_ds_eval_config(offload=args.ref_offload),
+        ds_config=strategy.get_ds_eval_config(offload=args.ref_offload) if not args.fsdp else None,
         packing_samples=args.packing_samples,
     )
     if args.ref_offload:
@@ -55,7 +58,8 @@ def train(args):
         )
 
     # configure optimizer
-    optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
+    if not args.fsdp:
+        optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
 
     # prepare for data and dataset
     train_data, eval_data = blending_datasets(
@@ -77,6 +81,7 @@ def train(args):
         strategy,
         input_template=args.input_template,
         is_dpo=True,
+        num_processors=1,
         multiple_of=args.ring_attn_size,
     )
     eval_dataset = RewardDataset(
@@ -86,6 +91,7 @@ def train(args):
         strategy,
         input_template=args.input_template,
         is_dpo=True,
+        num_processors=1,
         multiple_of=args.ring_attn_size,
     )
 
@@ -107,26 +113,58 @@ def train(args):
     )
 
     # scheduler
-    num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
-    max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+    if not args.fsdp:
+        num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
+        max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
 
-    scheduler = get_scheduler(
-        "cosine_with_min_lr",
-        optim,
-        num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
-        num_training_steps=max_steps,
-        scheduler_specific_kwargs={"min_lr": args.learning_rate * 0.1},
-    )
+        scheduler = get_scheduler(
+            "cosine_with_min_lr",
+            optim,
+            num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
+            num_training_steps=max_steps,
+            scheduler_specific_kwargs={"min_lr": args.learning_rate * 0.1},
+        )
 
     # strategy prepare
-    ((model, optim, scheduler), ref_model) = strategy.prepare((model, optim, scheduler), ref_model)
+    if not args.fsdp:
+        ((model, optim, scheduler), ref_model) = strategy.prepare((model, optim, scheduler), ref_model)
+
+    # init model with fsdp, then configure optimizer and scheduler
+    if args.fsdp:
+        import torch
+
+        # param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # print(f"before fsdp rank:{torch.distributed.get_rank()}, param_count:{param_count}", flush=True)
+
+        (model, ref_model) = strategy.prepare(model, ref_model)
+
+        # param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # print(f"after fsdp rank:{torch.distributed.get_rank()}, param_count:{param_count}", flush=True)
+
+        # for name, param in model.named_parameters():
+        #     print(f"after fsdp name:{name} param:{param}", flush=True)
+
+        optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
+
+        num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
+        max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+        scheduler = get_scheduler(
+            "cosine_with_min_lr",
+            optim,
+            num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
+            num_training_steps=max_steps,
+            scheduler_specific_kwargs={"min_lr": args.learning_rate * 0.1},
+        )
+
+        print(f"init model with fsdp, then configure optimizer and scheduler", flush=True)
 
     # load checkpoint
     consumed_samples = 0
     if args.load_checkpoint and os.path.exists(args.ckpt_path):
         _, states = strategy.load_ckpt(model.model, args.ckpt_path)
-        consumed_samples = states["consumed_samples"]
-        strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
+        # consumed_samples = states["consumed_samples"]
+        # strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
+        strategy.print(f"Loaded the checkpoint: {args.ckpt_path}")
 
     os.makedirs(args.save_path, exist_ok=True)
 
@@ -172,6 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
+    parser.add_argument("--fsdp", action="store_true", default=False, help="Enable FSDP")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")
     parser.add_argument("--bf16", action="store_true", default=False, help="Enable bfloat16")
     parser.add_argument("--ref_offload", action="store_true", default=False)
