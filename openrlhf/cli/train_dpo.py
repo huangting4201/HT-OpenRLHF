@@ -3,18 +3,26 @@ import math
 import os
 from datetime import datetime
 
+import torch
+
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import RewardDataset
 from openrlhf.models import Actor
 from openrlhf.trainer import DPOTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer, print_mem_usage
 
 
 def train(args):
+    # torch.cuda.memory._record_memory_history()
+
+    print_mem_usage("start")
+
     # configure strategy
     strategy = get_strategy(args)
     strategy.setup_distributed()
+
+    print_mem_usage("after configure strategy")
 
     # configure model
     # load huggingface model
@@ -31,9 +39,13 @@ def train(args):
         packing_samples=args.packing_samples,
     )
 
+    print_mem_usage("after init actor model")
+
     # configure tokenizer
     tokenizer = get_tokenizer(args.pretrain, model.model, "right", strategy, use_fast=not args.disable_fast_tokenizer)
     strategy.print(model)
+
+    print_mem_usage("after configure tokenizer")
 
     # load weights for ref model
     ref_model = Actor(
@@ -44,6 +56,9 @@ def train(args):
         ds_config=strategy.get_ds_eval_config(offload=args.ref_offload),
         packing_samples=args.packing_samples,
     )
+
+    print_mem_usage("after init ref model")
+
     if args.ref_offload:
         ref_model._offload = True
     get_tokenizer(args.pretrain, ref_model.model, "right", strategy, use_fast=not args.disable_fast_tokenizer)
@@ -56,6 +71,8 @@ def train(args):
 
     # configure optimizer
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
+
+    print_mem_usage("after configure optimizer")
 
     # prepare for data and dataset
     train_data, eval_data = blending_datasets(
@@ -106,6 +123,8 @@ def train(args):
         eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
     )
 
+    print_mem_usage("after configure dataset and dataloader")
+
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
     max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
@@ -118,8 +137,12 @@ def train(args):
         scheduler_specific_kwargs={"min_lr": args.learning_rate * 0.1},
     )
 
+    print_mem_usage("after configure scheduler")
+
     # strategy prepare
     ((model, optim, scheduler), ref_model) = strategy.prepare((model, optim, scheduler), ref_model)
+
+    print_mem_usage("after strategy prepare")
 
     # load checkpoint
     consumed_samples = 0
@@ -172,6 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
+    parser.add_argument("--fsdp", action="store_true", default=False, help="Enable FSDP")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")
     parser.add_argument("--bf16", action="store_true", default=False, help="Enable bfloat16")
     parser.add_argument("--ref_offload", action="store_true", default=False)

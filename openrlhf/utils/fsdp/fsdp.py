@@ -41,6 +41,7 @@ from openrlhf.utils.deepspeed.deepspeed_utils import (
 )
 from openrlhf.utils.utils import get_current_device
 
+from .fsdp_optimizer import FSDPadaptOptimizer
 
 ModelOptimPair = Tuple[nn.Module, Optimizer]
 ModelOrModelOptimPair = Union[nn.Module, ModelOptimPair]
@@ -171,10 +172,12 @@ class FSDPStrategy(ABC):
         if isinstance(model, Actor):
             model = model.model
         # Optimizer
-        AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
+        # AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
         optim_params = get_optimizer_grouped_parameters(model, kwargs["weight_decay"])
-        optim = AdamOptimizer(optim_params, **kwargs)
-        return optim
+        optim = torch.optim.AdamW(optim_params, fused=True, **kwargs)
+        # optim = AdamOptimizer(optim_params, **kwargs)
+        # return optim
+        return FSDPadaptOptimizer(optim)
 
     def backward(self, loss: torch.Tensor, model: nn.Module, optimizer: optim.Optimizer, **kwargs) -> None:
         # if isinstance(model, Actor):
@@ -193,8 +196,11 @@ class FSDPStrategy(ABC):
         # if isinstance(model, Actor):
         #     model = model.model
         # model.step()
+
         optimizer.step()
         scheduler.step()
+
+        print(f"rank:{torch.distributed.get_rank()} finish optimizer and scheduler step", flush=True)
 
     def setup_dataloader(
         self,

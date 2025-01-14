@@ -205,3 +205,14 @@ def initialize_profile(profiling: bool = False, start_time: str = None):
 
 def get_current_device():
     return torch.device("cuda:{}".format(torch.cuda.current_device()))
+
+
+def print_mem_usage(info: str):
+    print(
+        f"{info}: "
+        f"Allocated {round(torch.cuda.memory_allocated() / (1024 * 1024 * 1024),4 )} GB, "
+        f"Max_Allocated {round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024),4)} GB, "
+        f"Reserved {round(torch.cuda.memory_reserved()/ (1024 * 1024 * 1024),4)} GB, "
+        f"Max_Reserved {round(torch.cuda.max_memory_reserved()/ (1024 * 1024 * 1024),4)} GB ",
+        flush=True,
+    )

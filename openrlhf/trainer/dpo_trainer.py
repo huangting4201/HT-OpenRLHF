@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from openrlhf.models import DPOLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.utils import initialize_profile
+from openrlhf.utils.utils import initialize_profile, print_mem_usage
 
 
 class DPOTrainer(ABC):
@@ -213,6 +213,8 @@ class DPOTrainer(ABC):
                         client_states = {"consumed_samples": global_step * args.train_batch_size}
                         self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
                         prof.step()
+
+                    print_mem_usage(f"rank {torch.distributed.get_rank()}: step {step}")
 
                     step += 1
 
